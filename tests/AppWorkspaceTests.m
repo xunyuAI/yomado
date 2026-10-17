@@ -96,6 +96,26 @@ int main(void) {
         Check(YMWorkspacePhysicalReturnConfirmed(calculatorPhysical, calculatorPhysical, displays, NO), @"matching physical CG and AX observations confirm a manual return");
         Check(!YMWorkspacePhysicalReturnConfirmed(calculatorPhysical, calculatorPhysical, displays, YES), @"in-progress mutation never retires its own checkpoint");
         Check(!YMWorkspacePhysicalReturnConfirmed(calculatorPhysical, Frame(900, 675, 230, 408), displays, NO), @"disagreeing physical positions preserve placement while observations settle");
+        NSDictionary *mail = @{@"windowID": @4, @"pid": @20, @"title": @"收件箱", @"frame": Frame(0, 40, 900, 600)};
+        NSDictionary *docs = @{@"windowID": @9, @"pid": @20, @"title": @"  报告\n草稿  ", @"frame": Frame(20, 40, 800, 500)};
+        NSDictionary *sameA = @{@"windowID": @6, @"pid": @20, @"title": @"工作", @"frame": Frame(0, 40, 1000, 700)};
+        NSDictionary *sameB = @{@"windowID": @7, @"pid": @20, @"title": @"工作", @"frame": Frame(30, 40, 1100, 700)};
+        NSDictionary *overlapA = @{@"windowID": @11, @"pid": @20, @"title": @"标签", @"frame": Frame(0, 40, 800, 600)};
+        NSDictionary *overlapB = @{@"windowID": @12, @"pid": @20, @"title": @"标签", @"frame": Frame(0, 80, 800, 600)};
+        NSDictionary *blank = @{@"windowID": @2, @"pid": @20, @"title": @" \n ", @"frame": Frame(0, 40, 640, 480)};
+        NSArray *labels = YMWorkspaceWindowChoiceLabels(@[docs, mail, sameB, sameA, overlapB, overlapA, blank, @{@"windowID": @0, @"pid": @20}]);
+        Check(labels.count == 7, @"invalid window identity is omitted from the picker");
+        Check([labels[0][@"windowID"] isEqual:@2] && [labels[0][@"label"] isEqual:@"窗口 1 · 640×480"], @"blank title uses size and stable order");
+        Check([labels[1][@"label"] isEqual:@"收件箱"], @"distinct title stays unchanged");
+        Check([labels[2][@"label"] isEqual:@"工作 · 1000×700"] && [labels[3][@"label"] isEqual:@"工作 · 1100×700"], @"duplicate titles gain their sizes");
+        Check([labels[4][@"label"] isEqual:@"报告 草稿"], @"title whitespace collapses to one line");
+        Check([labels[5][@"label"] isEqual:@"标签 · 800×600 · 窗口 6"] && [labels[6][@"label"] isEqual:@"标签 · 800×600 · 窗口 7"], @"identical title and size gain an index");
+        NSString *longTitle = [@"" stringByPaddingToLength:60 withString:@"标题" startingAtIndex:0];
+        NSArray *truncated = YMWorkspaceWindowChoiceLabels(@[@{@"windowID": @1, @"pid": @3, @"title": longTitle, @"frame": Frame(0, 0, 800, 600)}]);
+        Check([truncated.firstObject[@"label"] hasSuffix:@"…"] && [truncated.firstObject[@"label"] length] <= 49, @"long titles stay short enough for a menu");
+        Check(YMWorkspaceMatchesWindow(@{@"windowID": @12, @"pid": @20}, @12, @20), @"exact window and process identity matches");
+        Check(!YMWorkspaceMatchesWindow(@{@"windowID": @12, @"pid": @21}, @12, @20), @"same window number from another process does not match");
+        Check(!YMWorkspaceMatchesWindow(@{@"windowID": @13, @"pid": @20}, @12, @20), @"another window of the same process does not match");
         if (failures) { fprintf(stderr, "%lu of %lu checks failed.\n", (unsigned long)failures, (unsigned long)checks); return 1; }
         printf("Passed %lu App workspace policy checks; no displays, applications or GUI were accessed.\n", (unsigned long)checks);
         return 0;

@@ -1134,6 +1134,79 @@ static NSView *YMSpacer(void) {
         [self updateInventory];
     }
 }
+- (NSArray<NSDictionary *> *)destinationDisplaysExcept:(CGDirectDisplayID)sourceID {
+    NSMutableArray<NSDictionary *> *result = [NSMutableArray array];
+    NSArray<NSNumber *> *ordered = self.workspaceViewIDs.count ? self.workspaceViewIDs : self.workspaceViews.allKeys;
+    for (NSNumber *key in ordered) {
+        if (![key isKindOfClass:NSNumber.class] || !key.unsignedIntValue || key.unsignedIntValue == sourceID) continue;
+        YMAppWorkspaceView *view = self.workspaceViews[key];
+        if (!view) continue;
+        [result addObject:@{@"displayID": key, @"name": view.displayName.length ? view.displayName : @"屏幕"}];
+    }
+    return result;
+}
+- (void)appendWindowPickerToMenu:(NSMenu *)menu row:(NSDictionary *)row sourceDisplayID:(CGDirectDisplayID)sourceID {
+    if (self.previewMode || ![row isKindOfClass:NSDictionary.class]) return;
+    NSString *bundle = row[@"bundleIdentifier"];
+    if (![bundle isKindOfClass:NSString.class] || !bundle.length || !sourceID) return;
+    NSArray<NSDictionary *> *choices = [self.appWorkspace windowChoicesForBundleIdentifier:bundle onDisplayID:sourceID];
+    if (choices.count < 2) return;
+    if (menu.numberOfItems) [menu addItem:NSMenuItem.separatorItem];
+    NSMenuItem *header = [[NSMenuItem alloc] initWithTitle:@"只移动其中一个窗口" action:nil keyEquivalent:@""];
+    header.enabled = NO;
+    [menu addItem:header];
+    NSArray<NSDictionary *> *destinations = [self destinationDisplaysExcept:sourceID];
+    for (NSDictionary *choice in choices) {
+        NSString *label = choice[@"label"];
+        if (![label isKindOfClass:NSString.class] || !label.length || ![choice[@"windowID"] isKindOfClass:NSNumber.class] ||
+            ![choice[@"pid"] isKindOfClass:NSNumber.class]) continue;
+        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:label action:nil keyEquivalent:@""];
+        NSMenu *submenu = [[NSMenu alloc] initWithTitle:label];
+        submenu.autoenablesItems = NO;
+        if (!destinations.count) {
+            NSMenuItem *empty = [[NSMenuItem alloc] initWithTitle:@"没有其他屏幕" action:nil keyEquivalent:@""];
+            empty.enabled = NO;
+            [submenu addItem:empty];
+        }
+        for (NSDictionary *destination in destinations) {
+            NSMenuItem *move = [[NSMenuItem alloc] initWithTitle:[NSString stringWithFormat:@"移到 %@", destination[@"name"]]
+                                                         action:@selector(moveChosenWindow:) keyEquivalent:@""];
+            move.target = self;
+            move.representedObject = @{@"windowID": choice[@"windowID"], @"pid": choice[@"pid"],
+                @"sourceDisplayID": @(sourceID), @"targetDisplayID": destination[@"displayID"]};
+            [submenu addItem:move];
+        }
+        item.submenu = submenu;
+        [menu addItem:item];
+    }
+}
+- (void)moveChosenWindow:(NSMenuItem *)item {
+    if (self.previewMode || self.updateWorkspaceBusy || self.armed || self.preparing || self.restoring || self.displayOperationInProgress || self.appOperationInProgress) return;
+    NSDictionary *request = [item.representedObject isKindOfClass:NSDictionary.class] ? item.representedObject : nil;
+    CGWindowID windowID = [request[@"windowID"] unsignedIntValue];
+    pid_t pid = [request[@"pid"] intValue];
+    CGDirectDisplayID sourceID = [request[@"sourceDisplayID"] unsignedIntValue];
+    CGDirectDisplayID targetID = [request[@"targetDisplayID"] unsignedIntValue];
+    if (!windowID || pid <= 0 || !sourceID || !targetID) return;
+    YMManagedDisplay *destinationProfile = [self profileForDisplayID:targetID];
+    if (destinationProfile && ![self canMoveIntoProfile:destinationProfile]) {
+        [self reportApplicationError:nil fallback:@"这个虚拟屏的扩展模式或显示配置尚未通过检查，未移动任何窗口。请先恢复显示排列。"];
+        return;
+    }
+    self.appOperationInProgress = YES;
+    @try {
+        NSError *error = nil;
+        BOOL succeeded = [self.appWorkspace moveWindowID:windowID pid:pid fromDisplayID:sourceID toDisplayID:targetID error:&error];
+        if (!succeeded) [self reportApplicationError:error fallback:@"未能移动所选窗口。"];
+        else {
+            self.statusLabel.stringValue = @"所选窗口已移到另一块屏幕";
+            self.detailLabel.stringValue = @"同一应用的其他窗口仍留在原来的屏幕。";
+        }
+    } @finally {
+        self.appOperationInProgress = NO;
+        [self updateInventory];
+    }
+}
 - (void)chooseApplicationMenuItem:(NSMenuItem *)item {
     NSDictionary *choice = item.representedObject;
     [self dropApplication:choice[@"payload"] targetDisplayID:[choice[@"targetID"] unsignedIntValue]];
@@ -1158,6 +1231,28 @@ static NSView *YMSpacer(void) {
                                       action:@selector(chooseApplicationMenuItem:) profile:nil];
             item.representedObject = @{@"payload":payload, @"targetID":@(displayID)};
             NSImage *icon = [row[@"appIcon"] copy]; icon.size = NSMakeSize(16, 16); item.image = icon;
+            NSArray<NSDictionary *> *choices = [row[@"windowCount"] unsignedIntegerValue] > 1 && source.unsignedIntValue && displayID
+                ? [self.appWorkspace windowChoicesForBundleIdentifier:bundleID onDisplayID:source.unsignedIntValue] : @[];
+            if (choices.count > 1) {
+                NSMenu *windows = [[NSMenu alloc] initWithTitle:item.title];
+                windows.autoenablesItems = NO;
+                NSMenuItem *all = [[NSMenuItem alloc] initWithTitle:@"这个屏幕上的全部窗口" action:@selector(chooseApplicationMenuItem:) keyEquivalent:@""];
+                all.target = self;
+                all.representedObject = item.representedObject;
+                [windows addItem:all];
+                [windows addItem:NSMenuItem.separatorItem];
+                for (NSDictionary *choice in choices) {
+                    if (![choice[@"label"] isKindOfClass:NSString.class] || ![choice[@"windowID"] isKindOfClass:NSNumber.class] ||
+                        ![choice[@"pid"] isKindOfClass:NSNumber.class]) continue;
+                    NSMenuItem *one = [[NSMenuItem alloc] initWithTitle:choice[@"label"] action:@selector(moveChosenWindow:) keyEquivalent:@""];
+                    one.target = self;
+                    one.representedObject = @{@"windowID": choice[@"windowID"], @"pid": choice[@"pid"],
+                        @"sourceDisplayID": source, @"targetDisplayID": @(displayID)};
+                    [windows addItem:one];
+                }
+                item.action = nil;
+                item.submenu = windows;
+            }
             [menu addItem:item];
         }
     }
@@ -1208,6 +1303,9 @@ static NSView *YMSpacer(void) {
             view.onRestoreBundleIdentifier = ^(NSString *identifier) {
                 [weakSelf dropApplication:@{@"bundleIdentifier":identifier, @"sourceDisplayID":@(displayID)} targetDisplayID:0];
             };
+            view.onConfigureWindowMenu = ^(NSMenu *menu, NSDictionary *row, uint32_t sourceID) {
+                [weakSelf appendWindowPickerToMenu:menu row:row sourceDisplayID:sourceID];
+            };
             [self.applicationCards addArrangedSubview:view];
             CGFloat fraction = [item[@"logicalWidth"] doubleValue] / MAX(1, logicalWidth);
             [view.widthAnchor constraintEqualToAnchor:self.applicationCards.widthAnchor multiplier:fraction constant:-14.0 * (CGFloat)(displays.count - 1) * fraction].active = YES;
@@ -1218,6 +1316,10 @@ static NSView *YMSpacer(void) {
     for (NSDictionary *item in displays) {
         CGDirectDisplayID displayID = [item[@"displayID"] unsignedIntValue];
         YMAppWorkspaceView *view = self.workspaceViews[@(displayID)];
+        __weak ADController *weakSelf = self;
+        view.onConfigureWindowMenu = ^(NSMenu *menu, NSDictionary *row, uint32_t sourceID) {
+            [weakSelf appendWindowPickerToMenu:menu row:row sourceDisplayID:sourceID];
+        };
         YMManagedDisplay *profile = [self profileForDisplayID:displayID];
         view.displayName = profile ? [self titleForProfile:profile] : item[@"name"] ?: @"显示器";
         view.displayAspectRatio = [item[@"logicalWidth"] doubleValue] / MAX(1, [item[@"logicalHeight"] doubleValue]);

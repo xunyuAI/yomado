@@ -51,6 +51,7 @@ static NSMutableDictionary *Screen(NSInteger ident, NSInteger x, NSInteger y, BO
 @property NSUInteger delayRemovalID;
 @property NSUInteger commits;
 @property NSUInteger cancels;
+@property NSInteger settleOriginDeltaY;
 @property(nonatomic) NSUInteger reconfigurationGeneration;
 @end
 
@@ -90,6 +91,7 @@ static NSMutableDictionary *Screen(NSInteger ident, NSInteger x, NSInteger y, BO
     (void)displayID; (void)width; (void)height; (void)hiDPI; (void)error;
     return self.rejectMode ? nil : self.preferredMode;
 }
+- (void)performConfigurationTransaction:(void (^)(void))work { work(); }
 - (BOOL)beginConfiguration:(NSError **)error {
     (void)error; [self.calls addObject:@"begin"];
     self.staged = [NSMutableArray array];
@@ -131,6 +133,10 @@ static NSMutableDictionary *Screen(NSInteger ident, NSInteger x, NSInteger y, BO
     for (NSDictionary *item in self.staged) {
         NSUInteger mirror = [item[@"mirrorOf"] unsignedIntegerValue];
         if (mirror) [self find:mirror in:self.staged][@"inMirrorSet"] = @YES;
+    }
+    if (self.settleOriginDeltaY) {
+        NSMutableDictionary *added = [self find:3 in:self.staged];
+        if (added) added[@"y"] = @([added[@"y"] integerValue] + self.settleOriginDeltaY);
     }
     if (!self.suppressCommit) self.screens = self.staged;
     self.staged = nil; self.reconfigurationGeneration++;
@@ -186,6 +192,14 @@ static void RunTests(void) {
     Check(![t isExtendedTarget:3 width:1920 height:1080 hiDPI:YES], @"incorrect scale denied");
     Check(b.waits >= 15, @"at least 1.5 seconds of stable observations required");
     Check(![b.calls containsObject:@"mode:1"], @"unchanged original mode not rewritten");
+    b = [FakeBackend new]; t = [[YMDisplayTopology alloc] initWithBackend:b]; s = Baseline(t); AddNew(b);
+    b.settleOriginDeltaY = -1;
+    Check(Configure(t, s), @"macOS settling the new screen one pixel away still verifies");
+    Check([[b find:3 in:b.screens][@"y"] integerValue] == -1, @"settled one-pixel origin is the admitted position");
+    Check([[b find:1 in:b.screens][@"y"] integerValue] == 0, @"physical origin stays exact");
+    b = [FakeBackend new]; t = [[YMDisplayTopology alloc] initWithBackend:b]; s = Baseline(t); AddNew(b);
+    b.settleOriginDeltaY = -2;
+    Check(!Configure(t, s), @"a larger origin change is not treated as settled");
 
     for (NSUInteger mirrored = 0; mirrored < 2; mirrored++) {
         b = [FakeBackend new]; t = [[YMDisplayTopology alloc] initWithBackend:b]; s = Baseline(t); AddNew(b);

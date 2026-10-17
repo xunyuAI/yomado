@@ -54,6 +54,18 @@ static void YMReconfigured(CGDirectDisplayID display, CGDisplayChangeSummaryFlag
     [(__bridge YMCoreGraphicsTopologyBackend *)context didReconfigure];
 }
 
+// AppKit services scaled-display notifications on the main run loop. A
+// configuration transaction on another thread races that work and macOS
+// replaces the built-in scaled mode. Keep the transaction on the main thread.
+static BOOL YMOnMainThread(NSError **error, BOOL (^work)(NSError **error)) {
+    if ([NSThread isMainThread]) return work(error);
+    __block BOOL ok = NO;
+    __block NSError *failure = nil;
+    dispatch_sync(dispatch_get_main_queue(), ^{ ok = work(&failure); });
+    if (error) *error = failure;
+    return ok;
+}
+
 @implementation YMCoreGraphicsTopologyBackend
 - (instancetype)init {
     if ((self = [super init])) {
@@ -135,7 +147,14 @@ static void YMReconfigured(CGDirectDisplayID display, CGDisplayChangeSummaryFlag
     if (!selected) YMFail(error, 5, @"The virtual display's requested resolution and scale are unavailable.");
     return selected;
 }
+- (void)performConfigurationTransaction:(void (^)(void))work {
+    if ([NSThread isMainThread]) work();
+    else dispatch_sync(dispatch_get_main_queue(), work);
+}
 - (BOOL)beginConfiguration:(NSError **)error {
+    if (![NSThread isMainThread]) return YMOnMainThread(error, ^BOOL(NSError **inner) {
+        return [self beginConfiguration:inner];
+    });
     if (_configuration) return YMFail(error, 6, @"A display transaction is already in progress.");
     CGError result = CGBeginDisplayConfiguration(&_configuration);
     if (result != kCGErrorSuccess || !_configuration) {
@@ -145,18 +164,30 @@ static void YMReconfigured(CGDirectDisplayID display, CGDisplayChangeSummaryFlag
     return YES;
 }
 - (BOOL)setMirrorOfDisplay:(CGDirectDisplayID)displayID toDisplay:(CGDirectDisplayID)targetID error:(NSError **)error {
+    if (![NSThread isMainThread]) return YMOnMainThread(error, ^BOOL(NSError **inner) {
+        return [self setMirrorOfDisplay:displayID toDisplay:targetID error:inner];
+    });
     CGError result = CGConfigureDisplayMirrorOfDisplay(_configuration, displayID, targetID);
     return result == kCGErrorSuccess || YMFail(error, result, @"macOS could not restore the requested mirror relationship.");
 }
 - (BOOL)setModeOfDisplay:(CGDirectDisplayID)displayID token:(id)modeToken error:(NSError **)error {
+    if (![NSThread isMainThread]) return YMOnMainThread(error, ^BOOL(NSError **inner) {
+        return [self setModeOfDisplay:displayID token:modeToken error:inner];
+    });
     CGError result = CGConfigureDisplayWithDisplayMode(_configuration, displayID, (__bridge CGDisplayModeRef)modeToken, NULL);
     return result == kCGErrorSuccess || YMFail(error, result, @"macOS could not restore the saved display mode.");
 }
 - (BOOL)setOriginOfDisplay:(CGDirectDisplayID)displayID x:(int32_t)x y:(int32_t)y error:(NSError **)error {
+    if (![NSThread isMainThread]) return YMOnMainThread(error, ^BOOL(NSError **inner) {
+        return [self setOriginOfDisplay:displayID x:x y:y error:inner];
+    });
     CGError result = CGConfigureDisplayOrigin(_configuration, displayID, x, y);
     return result == kCGErrorSuccess || YMFail(error, result, @"macOS could not preserve the saved display position.");
 }
 - (BOOL)commitConfiguration:(NSError **)error {
+    if (![NSThread isMainThread]) return YMOnMainThread(error, ^BOOL(NSError **inner) {
+        return [self commitConfiguration:inner];
+    });
     // CoreGraphics consumes the transaction even when completion fails.
     CGDisplayConfigRef configuration = _configuration;
     _configuration = NULL;
@@ -164,6 +195,10 @@ static void YMReconfigured(CGDirectDisplayID display, CGDisplayChangeSummaryFlag
     return result == kCGErrorSuccess || YMFail(error, result, @"macOS rejected the display configuration transaction.");
 }
 - (void)cancelConfiguration {
+    if (![NSThread isMainThread]) {
+        dispatch_sync(dispatch_get_main_queue(), ^{ [self cancelConfiguration]; });
+        return;
+    }
     if (_configuration) { CGCancelDisplayConfiguration(_configuration); _configuration = NULL; }
 }
 - (void)waitForNextObservation {
@@ -223,6 +258,7 @@ static void YMReconfigured(CGDirectDisplayID display, CGDisplayChangeSummaryFlag
 @interface YMDisplayTopology ()
 @property(nonatomic, strong) id<YMDisplayTopologyBackend> backend;
 @property(nonatomic) NSUInteger modeRetriesRemaining;
+@property(nonatomic) CGDirectDisplayID originSlackDisplayID;
 @end
 
 @implementation YMDisplayTopology
@@ -277,15 +313,40 @@ static void YMReconfigured(CGDirectDisplayID display, CGDisplayChangeSummaryFlag
 }
 
 - (BOOL)statesOf:(NSArray<NSDictionary *> *)actual match:(NSArray<NSDictionary *> *)expected {
+    return [self statesOf:actual match:expected slackDisplay:0];
+}
+
+- (BOOL)statesOf:(NSArray<NSDictionary *> *)actual match:(NSArray<NSDictionary *> *)expected slackDisplay:(CGDirectDisplayID)slackDisplay {
     NSMutableDictionary *byID = [NSMutableDictionary dictionary];
     for (NSDictionary *item in actual) byID[item[@"displayID"]] = item;
-    NSArray *keys = @[@"main", @"active", @"online", @"rotation", @"mirrorOf", @"inMirrorSet",
-        @"x", @"y", @"logicalWidth", @"logicalHeight"];
     for (NSDictionary *item in expected) {
         NSDictionary *live = byID[item[@"displayID"]];
+        BOOL relaxOrigin = slackDisplay && [item[@"displayID"] unsignedIntValue] == slackDisplay;
+        NSMutableArray *keys = [@[@"main", @"active", @"online", @"rotation", @"mirrorOf", @"inMirrorSet",
+            @"x", @"y", @"logicalWidth", @"logicalHeight"] mutableCopy];
+        if (relaxOrigin) { [keys removeObject:@"x"]; [keys removeObject:@"y"]; }
         if (!live || !YMKeysEqual(item, live, keys) || !YMKeysEqual(item, live, YMModeKeys())) return NO;
+        if (relaxOrigin) {
+            double dx = fabs([item[@"x"] doubleValue] - [live[@"x"] doubleValue]);
+            double dy = fabs([item[@"y"] doubleValue] - [live[@"y"] doubleValue]);
+            if (dx > 1.0 || dy > 1.0) return NO;
+        }
     }
     return YES;
+}
+
+- (NSArray<NSDictionary *> *)displays:(NSArray<NSDictionary *> *)expected pinningOriginOf:(CGDirectDisplayID)displayID from:(NSArray<NSDictionary *> *)live {
+    NSDictionary *settled = nil;
+    for (NSDictionary *item in live) if ([item[@"displayID"] unsignedIntValue] == displayID) settled = item;
+    if (!settled) return expected;
+    NSMutableArray *items = [NSMutableArray arrayWithCapacity:expected.count];
+    for (NSDictionary *item in expected) {
+        if ([item[@"displayID"] unsignedIntValue] != displayID) { [items addObject:item]; continue; }
+        NSMutableDictionary *copy = item.mutableCopy;
+        copy[@"x"] = settled[@"x"]; copy[@"y"] = settled[@"y"];
+        [items addObject:copy.copy];
+    }
+    return items;
 }
 
 - (NSArray<NSDictionary *> *)readCompleteDisplaysWithGuard:(BOOL (^)(NSArray<NSDictionary *> *, NSError **))guard
@@ -380,8 +441,13 @@ static void YMReconfigured(CGDirectDisplayID display, CGDisplayChangeSummaryFlag
 
 - (BOOL)verifyExpected:(NSArray<NSDictionary *> *)expected error:(NSError **)error {
     NSUInteger stable = 0, generation = self.backend.reconfigurationGeneration;
+    NSArray *required = expected;
+    BOOL originPinned = NO;
+    CGDirectDisplayID slack = self.originSlackDisplayID;
     // Success requires matching full topology across independent observations,
     // not merely waiting a fixed delay or seeing a single cached good snapshot.
+    // A new display may settle one pixel from the requested origin; later
+    // samples have to repeat that same settled origin.
     for (NSUInteger attempt = 0; attempt < 30; attempt++) {
         [self.backend waitForNextObservation];
         NSArray *live = [self readCompleteDisplaysWithGuard:^BOOL(NSArray *items, NSError **guardError) {
@@ -389,9 +455,17 @@ static void YMReconfigured(CGDirectDisplayID display, CGDisplayChangeSummaryFlag
         } error:error];
         if (!live || ![self identitiesOf:live match:expected error:error]) return NO;
         NSUInteger nextGeneration = self.backend.reconfigurationGeneration;
-        if (generation != nextGeneration) stable = 0;
+        if (generation != nextGeneration) { stable = 0; required = expected; originPinned = NO; }
         generation = nextGeneration;
-        if ([self statesOf:live match:expected]) stable++; else stable = 0;
+        if ([self statesOf:live match:required slackDisplay:(originPinned ? 0 : slack)]) {
+            if (!originPinned && slack) {
+                required = [self displays:expected pinningOriginOf:slack from:live];
+                originPinned = YES;
+            }
+            stable++;
+        } else {
+            stable = 0; required = expected; originPinned = NO;
+        }
         if (stable >= 5 && attempt >= 14) return YES;
     }
     return YMFail(error, 17, @"macOS did not preserve the requested display layout, main screen, modes and mirror relationships. Application moves remain disabled.");
@@ -418,56 +492,60 @@ static void YMReconfigured(CGDirectDisplayID display, CGDisplayChangeSummaryFlag
     if (!fresh || ![self identitiesOf:fresh match:expected error:error]
         || ![self statesOf:fresh match:current])
         return YMFail(error, 20, @"The display configuration changed before the transaction could start.");
-    if (![self.backend beginConfiguration:error]) return NO;
-    BOOL staged = YES;
-    // Remove changed follower edges only. Never issue a global unmirror, and
-    // never touch unrelated pre-existing mirror relationships.
-    for (NSDictionary *item in expected) {
-        NSDictionary *live = currentByID[item[@"displayID"]];
-        if (!YMValuesEqual(item[@"mirrorOf"], live[@"mirrorOf"]) && [live[@"mirrorOf"] unsignedIntValue]) {
-            staged = [self.backend setMirrorOfDisplay:[item[@"displayID"] unsignedIntValue] toDisplay:0 error:error];
-            if (!staged) break;
-        }
-    }
-    if (staged) for (NSDictionary *item in expected) {
-        NSDictionary *live = currentByID[item[@"displayID"]];
-        if (!YMKeysEqual(item, live, YMModeKeys())) {
-            staged = [self.backend setModeOfDisplay:[item[@"displayID"] unsignedIntValue] token:item[@"modeToken"] error:error];
-            if (!staged) break;
-        }
-    }
-    // Pin every extended root's saved origin because CoreGraphics may otherwise
-    // reposition unspecified displays. Setting a follower's origin unmirrors it,
-    // so followers are deliberately omitted and their edges are restored last.
-    if (staged) for (NSNumber *mainPass in @[@YES, @NO]) {
-        for (NSDictionary *item in expected) {
-            if ([item[@"main"] boolValue] != mainPass.boolValue || [item[@"mirrorOf"] unsignedIntValue]) continue;
-            double x = [item[@"x"] doubleValue], y = [item[@"y"] doubleValue];
-            if (x < INT32_MIN || x > INT32_MAX || y < INT32_MIN || y > INT32_MAX || x != trunc(x) || y != trunc(y)) {
-                staged = YMFail(error, 21, @"The saved display position is outside the supported coordinate range."); break;
+    __block BOOL staged = YES;
+    __block NSError *failure = nil;
+    [self.backend performConfigurationTransaction:^{
+        staged = [self.backend beginConfiguration:&failure];
+        // Remove changed follower edges only. Never issue a global unmirror, and
+        // never touch unrelated pre-existing mirror relationships.
+        if (staged) for (NSDictionary *item in expected) {
+            NSDictionary *live = currentByID[item[@"displayID"]];
+            if (!YMValuesEqual(item[@"mirrorOf"], live[@"mirrorOf"]) && [live[@"mirrorOf"] unsignedIntValue]) {
+                staged = [self.backend setMirrorOfDisplay:[item[@"displayID"] unsignedIntValue] toDisplay:0 error:&failure];
+                if (!staged) break;
             }
-            staged = [self.backend setOriginOfDisplay:[item[@"displayID"] unsignedIntValue] x:(int32_t)x y:(int32_t)y error:error];
+        }
+        if (staged) for (NSDictionary *item in expected) {
+            NSDictionary *live = currentByID[item[@"displayID"]];
+            if (!YMKeysEqual(item, live, YMModeKeys())) {
+                staged = [self.backend setModeOfDisplay:[item[@"displayID"] unsignedIntValue] token:item[@"modeToken"] error:&failure];
+                if (!staged) break;
+            }
+        }
+        // Pin every extended root's saved origin because CoreGraphics may otherwise
+        // reposition unspecified displays. Setting a follower's origin unmirrors it,
+        // so followers are deliberately omitted and their edges are restored last.
+        if (staged) for (NSNumber *mainPass in @[@YES, @NO]) {
+            for (NSDictionary *item in expected) {
+                if ([item[@"main"] boolValue] != mainPass.boolValue || [item[@"mirrorOf"] unsignedIntValue]) continue;
+                double x = [item[@"x"] doubleValue], y = [item[@"y"] doubleValue];
+                if (x < INT32_MIN || x > INT32_MAX || y < INT32_MIN || y > INT32_MAX || x != trunc(x) || y != trunc(y)) {
+                    staged = YMFail(&failure, 21, @"The saved display position is outside the supported coordinate range."); break;
+                }
+                staged = [self.backend setOriginOfDisplay:[item[@"displayID"] unsignedIntValue] x:(int32_t)x y:(int32_t)y error:&failure];
+                if (!staged) break;
+            }
             if (!staged) break;
         }
-        if (!staged) break;
-    }
-    if (staged) for (NSDictionary *item in expected) {
-        NSDictionary *live = currentByID[item[@"displayID"]];
-        CGDirectDisplayID mirror = [item[@"mirrorOf"] unsignedIntValue];
-        if (mirror && !YMValuesEqual(item[@"mirrorOf"], live[@"mirrorOf"])) {
-            staged = [self.backend setMirrorOfDisplay:[item[@"displayID"] unsignedIntValue] toDisplay:mirror error:error];
-            if (!staged) break;
+        if (staged) for (NSDictionary *item in expected) {
+            NSDictionary *live = currentByID[item[@"displayID"]];
+            CGDirectDisplayID mirror = [item[@"mirrorOf"] unsignedIntValue];
+            if (mirror && !YMValuesEqual(item[@"mirrorOf"], live[@"mirrorOf"])) {
+                staged = [self.backend setMirrorOfDisplay:[item[@"displayID"] unsignedIntValue] toDisplay:mirror error:&failure];
+                if (!staged) break;
+            }
         }
-    }
-    if (staged) {
-        NSArray *beforeCommit = [self.backend readDisplaysWithError:error];
-        if (!beforeCommit || ![self identitiesOf:beforeCommit match:current error:error]
-            || ![self statesOf:beforeCommit match:current]
-            || generation != self.backend.reconfigurationGeneration)
-            staged = YMFail(error, 22, @"A concurrent display change interrupted the transaction.");
-    }
-    if (!staged) { [self.backend cancelConfiguration]; return NO; }
-    if (![self.backend commitConfiguration:error]) { [self.backend cancelConfiguration]; return NO; }
+        if (staged) {
+            NSArray *beforeCommit = [self.backend readDisplaysWithError:&failure];
+            if (!beforeCommit || ![self identitiesOf:beforeCommit match:current error:&failure]
+                || ![self statesOf:beforeCommit match:current]
+                || generation != self.backend.reconfigurationGeneration)
+                staged = YMFail(&failure, 22, @"A concurrent display change interrupted the transaction.");
+        }
+        if (!staged) { [self.backend cancelConfiguration]; return; }
+        if (![self.backend commitConfiguration:&failure]) { [self.backend cancelConfiguration]; staged = NO; }
+    }];
+    if (!staged) { if (error) *error = failure; return NO; }
     return [self verifyExpected:expected error:error];
 }
 
@@ -544,7 +622,10 @@ static void YMReconfigured(CGDirectDisplayID display, CGDisplayChangeSummaryFlag
     target[@"rotation"] = @0;
     NSMutableArray *expected = [baseline.displays mutableCopy];
     [expected addObject:target];
-    return [self apply:expected from:current error:error];
+    self.originSlackDisplayID = displayID;
+    BOOL applied = [self apply:expected from:current error:error];
+    self.originSlackDisplayID = 0;
+    return applied;
 }
 
 - (BOOL)restoreAndVerifySnapshot:(YMDisplayTopologySnapshot *)snapshot excludingDisplayID:(CGDirectDisplayID)displayID error:(NSError **)error {

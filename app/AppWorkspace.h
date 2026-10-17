@@ -30,6 +30,17 @@ FOUNDATION_EXPORT NSString * const YMAppWorkspaceErrorDomain;
 // other source IDs select only that display, preserving the app's other windows.
 - (BOOL)moveApplicationAtURL:(NSURL *)URL fromDisplayID:(CGDirectDisplayID)sourceID
                 toDisplayID:(CGDirectDisplayID)displayID error:(NSError * _Nullable * _Nullable)error;
+// One ordinary window of an app that has several. Labels are for the open menu
+// only: windowID, pid, and label. They are not stored or written to disk.
+- (NSArray<NSDictionary *> *)windowChoicesForBundleIdentifier:(NSString *)bundleIdentifier
+                                                 onDisplayID:(CGDirectDisplayID)displayID;
+// Move exactly one window. sourceDisplayID is the screen it currently occupies.
+// Other windows of the same app stay where they are.
+- (BOOL)moveWindowID:(CGWindowID)windowID
+                 pid:(pid_t)pid
+       fromDisplayID:(CGDirectDisplayID)sourceDisplayID
+         toDisplayID:(CGDirectDisplayID)displayID
+               error:(NSError * _Nullable * _Nullable)error;
 - (BOOL)restoreApplicationWithBundleIdentifier:(NSString *)bundleIdentifier
                                 fromDisplayID:(CGDirectDisplayID)displayID
                                         error:(NSError * _Nullable * _Nullable)error;

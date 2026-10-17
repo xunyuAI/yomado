@@ -146,6 +146,96 @@ static inline BOOL YMWorkspaceMatchesSource(NSDictionary *window, NSNumber *sour
 // An old physical CG frame alone must not retire a freshly captured origin.
 // Confirm a manual physical return only when both independent observations
 // agree; absent, stale or inaccessible geometry always preserves the record.
+// Picker labels are ephemeral UI text. Callers may show them in a menu and
+// must not write them into checkpoints, logs, or saved preferences.
+static inline NSString *YMWorkspaceCleanWindowTitle(NSString *title) {
+    if (![title isKindOfClass:NSString.class] || !title.length) return @"";
+    NSCharacterSet *skip = NSCharacterSet.whitespaceAndNewlineCharacterSet;
+    NSCharacterSet *controls = NSCharacterSet.controlCharacterSet;
+    NSMutableString *clean = [NSMutableString string];
+    BOOL pendingSpace = NO;
+    for (NSUInteger index = 0; index < title.length; ) {
+        NSRange range = [title rangeOfComposedCharacterSequenceAtIndex:index];
+        NSString *part = [title substringWithRange:range];
+        index = NSMaxRange(range);
+        unichar character = [part characterAtIndex:0];
+        if (part.length == 1 && ([skip characterIsMember:character] || [controls characterIsMember:character])) {
+            pendingSpace = clean.length > 0;
+            continue;
+        }
+        if (pendingSpace) [clean appendString:@" "];
+        pendingSpace = NO;
+        [clean appendString:part];
+    }
+    if (clean.length > 48) {
+        NSRange range = [clean rangeOfComposedCharacterSequencesForRange:NSMakeRange(0, 48)];
+        return [[clean substringWithRange:range] stringByAppendingString:@"…"];
+    }
+    return clean;
+}
+static inline NSString *YMWorkspaceWindowSizeText(NSDictionary *frame) {
+    if (!YMWorkspaceGeometry(frame)) return @"";
+    return [NSString stringWithFormat:@"%.0f×%.0f", [frame[@"width"] doubleValue], [frame[@"height"] doubleValue]];
+}
+// Stable, user-visible names for one app's windows on one display. Identical
+// titles gain a size, then an index, so a manual choice still identifies one window.
+static inline NSArray<NSDictionary *> *YMWorkspaceWindowChoiceLabels(NSArray<NSDictionary *> *windows) {
+    if (![windows isKindOfClass:NSArray.class] || !windows.count) return @[];
+    NSArray *sorted = [windows sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        uint32_t left = [a[@"windowID"] unsignedIntValue], right = [b[@"windowID"] unsignedIntValue];
+        if (left < right) return NSOrderedAscending;
+        if (left > right) return NSOrderedDescending;
+        return [a[@"pid"] compare:b[@"pid"] ?: @0];
+    }];
+    NSMutableArray<NSDictionary *> *drafts = [NSMutableArray array];
+    NSMutableDictionary<NSString *, NSNumber *> *baseCounts = [NSMutableDictionary dictionary];
+    NSUInteger index = 1;
+    for (NSDictionary *window in sorted) {
+        if (![window isKindOfClass:NSDictionary.class] || ![window[@"windowID"] isKindOfClass:NSNumber.class] ||
+            ![window[@"pid"] isKindOfClass:NSNumber.class] || ![window[@"windowID"] unsignedIntValue] ||
+            ![window[@"pid"] intValue]) continue;
+        NSString *title = YMWorkspaceCleanWindowTitle(window[@"title"]);
+        NSString *size = YMWorkspaceWindowSizeText(window[@"frame"]);
+        NSString *base = title.length ? title : (size.length ? [NSString stringWithFormat:@"窗口 %lu · %@", (unsigned long)index, size] :
+            [NSString stringWithFormat:@"窗口 %lu", (unsigned long)index]);
+        baseCounts[base] = @([baseCounts[base] unsignedIntegerValue] + 1);
+        [drafts addObject:@{@"windowID": window[@"windowID"], @"pid": window[@"pid"], @"base": base,
+            @"size": size, @"index": @(index)}];
+        index++;
+    }
+    NSMutableArray<NSString *> *labels = [NSMutableArray array];
+    NSMutableDictionary<NSString *, NSNumber *> *labelCounts = [NSMutableDictionary dictionary];
+    for (NSDictionary *draft in drafts) {
+        NSString *label = draft[@"base"];
+        if ([baseCounts[label] unsignedIntegerValue] > 1) {
+            NSString *size = draft[@"size"];
+            label = size.length ? [NSString stringWithFormat:@"%@ · %@", draft[@"base"], size] :
+                [NSString stringWithFormat:@"%@ · 窗口 %@", draft[@"base"], draft[@"index"]];
+        }
+        labelCounts[label] = @([labelCounts[label] unsignedIntegerValue] + 1);
+        [labels addObject:label];
+    }
+    NSMutableDictionary<NSString *, NSNumber *> *seen = [NSMutableDictionary dictionary];
+    NSMutableArray *result = [NSMutableArray array];
+    [drafts enumerateObjectsUsingBlock:^(NSDictionary *draft, NSUInteger position, BOOL *stop) {
+        (void)stop;
+        NSString *label = labels[position];
+        if ([labelCounts[label] unsignedIntegerValue] > 1) {
+            NSUInteger occurrence = [seen[label] unsignedIntegerValue] + 1;
+            seen[label] = @(occurrence);
+            label = [NSString stringWithFormat:@"%@ · 窗口 %@", label, draft[@"index"]];
+        }
+        [result addObject:@{@"windowID": draft[@"windowID"], @"pid": draft[@"pid"], @"label": label}];
+    }];
+    return result;
+}
+static inline BOOL YMWorkspaceMatchesWindow(NSDictionary *window, NSNumber *windowID, NSNumber *pid) {
+    if (![window isKindOfClass:NSDictionary.class] || ![windowID isKindOfClass:NSNumber.class] ||
+        ![pid isKindOfClass:NSNumber.class]) return NO;
+    return [windowID unsignedIntValue] > 0 && [pid intValue] > 0 &&
+        [window[@"windowID"] unsignedIntValue] == [windowID unsignedIntValue] &&
+        [window[@"pid"] intValue] == [pid intValue];
+}
 static inline BOOL YMWorkspacePhysicalReturnConfirmed(NSDictionary *cgFrame, NSDictionary *axFrame,
                                                       NSArray *displays, BOOL operationInProgress) {
     if (operationInProgress || !YMWorkspaceSameFrame(cgFrame, axFrame)) return NO;

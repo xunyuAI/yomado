@@ -24,6 +24,8 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic, copy, nullable) void (^onChooseApplication)(void);
 @property(nonatomic, copy, nullable) void (^onManageDisplay)(void);
 @property(nonatomic, copy, nullable) void (^onRestoreBundleIdentifier)(NSString *bundleIdentifier);
+// Called while a multi-window icon menu is being built. Add items only; do not rebuild the panel.
+@property(nonatomic, copy, nullable) void (^onConfigureWindowMenu)(NSMenu *menu, NSDictionary *row, uint32_t sourceDisplayID);
 
 // Rows: appName, bundleIdentifier, pid, windowCount, managedWindowCount, appURL (NSURL),
 // and optional appIcon (NSImage). The counts describe detected visible windows, not GPU activity.

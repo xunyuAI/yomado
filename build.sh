@@ -58,8 +58,19 @@ ym_bundle="$ym_stage/Yomado.app"
 mkdir -p "$ym_bundle/Contents/MacOS" "$ym_bundle/Contents/Resources"
 mkdir -p "$ym_bundle/Contents/Frameworks"
 
+# Host architecture by default. YOMADO_ARCHS="x86_64" builds an Intel slice;
+# "arm64 x86_64" builds a universal binary when the SDK has both slices.
+ym_arch_flags=()
+for ym_arch in ${YOMADO_ARCHS:-$(uname -m)}; do
+  case "$ym_arch" in
+    x86_64|arm64) ym_arch_flags+=(-arch "$ym_arch") ;;
+    *) printf 'Unsupported architecture: %s\n' "$ym_arch" >&2; exit 1 ;;
+  esac
+done
+
 ym_flags=(
   -fobjc-arc -Wall -Wextra -Werror -g0
+  "${ym_arch_flags[@]}"
   -isysroot "$ym_sdk" -mmacosx-version-min=14.0
   "-ffile-prefix-map=$ym_root=."
   "-fmacro-prefix-map=$ym_root=."
@@ -125,4 +136,20 @@ mkdir -p "$ym_dist"
 rm -rf "$ym_output"
 /usr/bin/ditto --norsrc --noextattr "$ym_bundle" "$ym_output"
 /bin/mv -f "$ym_stage/Yomado.zip" "$ym_dist/Yomado.zip"
-printf 'Built: %s\nArchive: %s\n' "$ym_output" "$ym_dist/Yomado.zip"
+for ym_bin in "$ym_output/Contents/MacOS/Yomado" "$ym_output/Contents/MacOS/YomadoWatchdog"; do
+  ym_info="$(/usr/bin/lipo -info "$ym_bin")"
+  printf '%s\n' "$ym_info"
+  for ym_arch in ${YOMADO_ARCHS:-$(uname -m)}; do
+    case "$ym_info" in
+      *"$ym_arch"*) ;;
+      *) printf '%s is missing the %s slice.\n' "$ym_bin" "$ym_arch" >&2; exit 1 ;;
+    esac
+  done
+done
+ym_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$ym_output/Contents/Info.plist")"
+ym_pkg_arch="$(printf '%s' "${YOMADO_ARCHS:-$(uname -m)}" | /usr/bin/tr ' ' '-')"
+ym_pkg="$ym_dist/Yomado-${ym_pkg_arch}.pkg"
+rm -f "$ym_pkg"
+/usr/bin/pkgbuild --component "$ym_output" --install-location /Applications \
+  --identifier dev.chekusu.yomado --version "$ym_version" "$ym_pkg"
+printf 'Built: %s\nArchive: %s\nInstaller: %s\n' "$ym_output" "$ym_dist/Yomado.zip" "$ym_pkg"

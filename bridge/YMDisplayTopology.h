@@ -22,6 +22,9 @@ FOUNDATION_EXPORT NSErrorDomain const YMDisplayTopologyErrorDomain;
 - (nullable NSArray<NSDictionary<NSString *, id> *> *)readDisplaysWithError:(NSError **)error;
 - (nullable NSDictionary<NSString *, id> *)modeForDisplay:(CGDirectDisplayID)displayID
     width:(NSUInteger)width height:(NSUInteger)height hiDPI:(BOOL)hiDPI error:(NSError **)error;
+/// Runs one display transaction without returning to the AppKit run loop.
+/// Splitting the transaction across turns lets AppKit replace a scaled built-in mode.
+- (void)performConfigurationTransaction:(void (^)(void))work;
 - (BOOL)beginConfiguration:(NSError **)error;
 - (BOOL)setMirrorOfDisplay:(CGDirectDisplayID)displayID toDisplay:(CGDirectDisplayID)targetID error:(NSError **)error;
 - (BOOL)setModeOfDisplay:(CGDirectDisplayID)displayID token:(id)modeToken error:(NSError **)error;

@@ -228,11 +228,39 @@ static BOOL YMWOrdinaryWindow(id element) {
         }
     return nil;
 }
-- (NSArray<NSDictionary *> *)candidatesForApplication:(NSRunningApplication *)app sourceFilter:(NSNumber *)filter error:(NSError **)error {
+- (NSArray<NSDictionary *> *)windowChoicesForBundleIdentifier:(NSString *)bundle onDisplayID:(CGDirectDisplayID)displayID {
+    if (!bundle.length || !displayID) return @[];
+    // Names are copied only into the returned menu labels. Inventory, placements,
+    // and restart checkpoints continue to omit window titles.
+    NSMutableDictionary<NSNumber *, NSString *> *names = [NSMutableDictionary dictionary];
+    NSArray *raw = CFBridgingRelease(CGWindowListCopyWindowInfo(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID));
+    for (NSDictionary *entry in raw) {
+        NSNumber *number = entry[(__bridge NSString *)kCGWindowNumber];
+        NSString *name = entry[(__bridge NSString *)kCGWindowName];
+        if ([number isKindOfClass:NSNumber.class] && [name isKindOfClass:NSString.class]) names[number] = name;
+    }
+    NSMutableArray *choices = [NSMutableArray array];
+    for (NSDictionary *window in self.windows) {
+        if (![window[@"bundleIdentifier"] isEqualToString:bundle] || [window[@"displayID"] unsignedIntValue] != displayID) continue;
+        [choices addObject:@{@"windowID": window[@"windowID"], @"pid": window[@"pid"],
+            @"title": names[window[@"windowID"]] ?: @"", @"frame": window[@"frame"] ?: @{}}];
+    }
+    return YMWorkspaceWindowChoiceLabels(choices);
+}
+- (NSArray<NSDictionary *> *)candidatesForApplication:(NSRunningApplication *)app sourceFilter:(NSNumber *)filter onlyWindowID:(CGWindowID)onlyWindowID onlyPID:(pid_t)onlyPID error:(NSError **)error {
     NSMutableArray *visible = [NSMutableArray array];
     for (NSDictionary *window in self.windows)
         if ([window[@"pid"] intValue] == app.processIdentifier && YMWorkspaceMatchesSource(window, filter))
             [visible addObject:window];
+    if (onlyWindowID) {
+        NSMutableArray *selected = [NSMutableArray array];
+        for (NSDictionary *window in visible)
+            if ([window[@"windowID"] unsignedIntValue] == onlyWindowID && [window[@"pid"] intValue] == onlyPID)
+                [selected addObject:window];
+        if (!selected.count) return @[];
+        visible = selected;
+    }
     AXUIElementRef ref = AXUIElementCreateApplication(app.processIdentifier);
     if (!ref) { [self fail:error code:5 text:@"无法访问应用窗口；请先打开应用主窗口。 "]; return nil; }
     AXUIElementSetMessagingTimeout(ref, 0.8);
@@ -245,6 +273,19 @@ static BOOL YMWOrdinaryWindow(id element) {
         BOOL found = NO;
         for (id window in raw) if (YMWElement(window) && CFEqual((__bridge CFTypeRef)window, (__bridge CFTypeRef)placement.element)) { found = YES; break; }
         if (!found) [self.placements removeObject:placement];
+    }
+    if (onlyWindowID) {
+        NSDictionary *targetFrame = visible.firstObject[@"frame"];
+        NSUInteger matches = 0;
+        for (id window in raw) {
+            if (!YMWOrdinaryWindow(window) || [YMWRead(window, kAXMinimizedAttribute) boolValue]) continue;
+            if (YMWorkspaceSameFrame(YMWFrame(window), targetFrame)) matches++;
+        }
+        if (matches != 1) {
+            [self fail:error code:22 text:matches ? @"这个窗口和另一个窗口的位置重叠，无法单独锁定。请先错开它们，再选择。" :
+                @"无法单独锁定这个窗口。请展开普通窗口并关掉弹窗后再选择。"];
+            return nil;
+        }
     }
     NSMutableArray *result = [NSMutableArray array]; NSMutableSet *used = [NSMutableSet set];
     for (id window in raw) {
@@ -305,7 +346,7 @@ static BOOL YMWOrdinaryWindow(id element) {
     }
     return NO;
 }
-- (BOOL)performMoveApplicationAtURL:(NSURL *)URL sourceFilter:(NSNumber *)filter toDisplayID:(CGDirectDisplayID)ID error:(NSError **)error {
+- (BOOL)performMoveApplicationAtURL:(NSURL *)URL sourceFilter:(NSNumber *)filter onlyWindowID:(CGWindowID)onlyWindowID onlyPID:(pid_t)onlyPID toDisplayID:(CGDirectDisplayID)ID error:(NSError **)error {
     NSAssert(NSThread.isMainThread, @"App workspace is main-thread only.");
     if (![self preflight:error]) return NO;
     NSDictionary *target = [self display:ID];
@@ -320,12 +361,14 @@ static BOOL YMWOrdinaryWindow(id element) {
     for (NSRunningApplication *app in [NSRunningApplication runningApplicationsWithBundleIdentifier:bundle.bundleIdentifier]) {
         if (app.terminated || ![app.bundleURL.URLByResolvingSymlinksInPath.URLByStandardizingPath isEqual:canonical]) continue;
         running = YES;
-        NSArray *candidates = [self candidatesForApplication:app sourceFilter:filter error:error]; if (!candidates) return NO;
+        NSArray *candidates = [self candidatesForApplication:app sourceFilter:filter onlyWindowID:onlyWindowID onlyPID:onlyPID error:error]; if (!candidates) return NO;
         for (NSDictionary *candidate in candidates) if ([candidate[@"displayID"] unsignedIntValue] != ID)
             [operations addObject:@{@"application": app, @"candidate": candidate}];
     }
     if (!running) return [self fail:error code:10 text:@"请先打开这个 App 的窗口，再将 App 拖入虚拟屏。"];
-    if (!operations.count) return [self fail:error code:18 text:@"没有需要移动的可见普通窗口；窗口可能已在目标屏，或仍处于隐藏、最小化状态。请先显示要移动的窗口。"];
+    if (!operations.count) return [self fail:error code:onlyWindowID ? 23 : 18 text:onlyWindowID ?
+        @"所选窗口已经在目标屏幕上，或已经不在原来的屏幕。未移动其他窗口。" :
+        @"没有需要移动的可见普通窗口；窗口可能已在目标屏，或仍处于隐藏、最小化状态。请先显示要移动的窗口。"];
     self.operationInProgress = YES; NSUInteger moved = 0;
     @try {
         for (NSDictionary *operation in operations) {
@@ -354,22 +397,64 @@ static BOOL YMWOrdinaryWindow(id element) {
             }
             moved++;
         }
-        self.statusText = [NSString stringWithFormat:@"已移入 %lu 个窗口。原位置在本次 yomado 运行期间保留。", (unsigned long)moved];
+        self.statusText = onlyWindowID ? @"已移动所选窗口。同一应用的其他窗口留在原来的屏幕。" :
+            [NSString stringWithFormat:@"已移入 %lu 个窗口。原位置在本次 yomado 运行期间保留。", (unsigned long)moved];
         return YES;
     } @finally { self.operationInProgress = NO; [self refreshInventory]; }
 }
 - (BOOL)moveApplicationAtURL:(NSURL *)URL toDisplayID:(CGDirectDisplayID)ID error:(NSError **)error {
-    return [self performMoveApplicationAtURL:URL sourceFilter:nil toDisplayID:ID error:error];
+    return [self performMoveApplicationAtURL:URL sourceFilter:nil onlyWindowID:0 onlyPID:0 toDisplayID:ID error:error];
 }
 - (BOOL)moveApplicationAtURL:(NSURL *)URL fromDisplayID:(CGDirectDisplayID)sourceID toDisplayID:(CGDirectDisplayID)ID error:(NSError **)error {
-    return [self performMoveApplicationAtURL:URL sourceFilter:@(sourceID) toDisplayID:ID error:error];
+    return [self performMoveApplicationAtURL:URL sourceFilter:@(sourceID) onlyWindowID:0 onlyPID:0 toDisplayID:ID error:error];
+}
+- (BOOL)performMoveSingleWindowToPhysical:(NSRunningApplication *)app windowID:(CGWindowID)windowID sourceID:(CGDirectDisplayID)sourceID target:(NSDictionary *)target error:(NSError **)error {
+    self.operationInProgress = YES;
+    @try {
+        NSArray *candidates = [self candidatesForApplication:app sourceFilter:@(sourceID) onlyWindowID:windowID onlyPID:app.processIdentifier error:error];
+        if (!candidates) return NO;
+        if (candidates.count != 1) return [self fail:error code:21 text:@"所选窗口已经不在原来的屏幕上，未移动其他窗口。"];
+        NSDictionary *candidate = candidates.firstObject;
+        id element = candidate[@"element"];
+        NSDictionary *before = YMWFrame(element);
+        if (!YMWorkspaceSameFrame(before, candidate[@"frame"]))
+            return [self fail:error code:11 text:@"窗口位置已变化，已停止移动。"];
+        NSDictionary *source = [self display:[candidate[@"displayID"] unsignedIntValue]];
+        YMWPlacement *placement = [self placementForElement:element application:app windowID:windowID];
+        BOOL fromVirtual = [self.ownedIDs containsObject:source[@"displayID"]];
+        NSDictionary *destination = fromVirtual ? YMWorkspaceFrameForExplicitPhysicalReturn(placement.origin, before, target) :
+            YMWorkspaceFrameOnDisplay(before, nil, target);
+        if (!destination) return [self fail:error code:19 text:@"指定的屏幕当前不可用，窗口保持原位。"];
+        if (![self placeElement:element frame:destination display:target application:app]) {
+            BOOL returned = source && [self placeElement:element frame:before display:source application:app];
+            return [self fail:error code:12 text:returned ? @"移屏未获验证，窗口已退回原处。" : @"尚未确认窗口位置；请在原屏幕上查看这个窗口。"];
+        }
+        if (fromVirtual && placement) [self.placements removeObject:placement];
+        self.statusText = @"已移动所选窗口。同一应用的其他窗口留在原来的屏幕。";
+        return YES;
+    } @finally { self.operationInProgress = NO; [self refreshInventory]; }
+}
+- (BOOL)moveWindowID:(CGWindowID)windowID pid:(pid_t)pid fromDisplayID:(CGDirectDisplayID)sourceID toDisplayID:(CGDirectDisplayID)targetID error:(NSError **)error {
+    NSAssert(NSThread.isMainThread, @"App workspace is main-thread only.");
+    if (!windowID || pid <= 0 || !sourceID || !targetID || sourceID == targetID)
+        return [self fail:error code:20 text:@"请选择一个窗口，以及另一块屏幕。"];
+    if (![self preflight:error]) return NO;
+    NSDictionary *target = [self display:targetID];
+    if (![self displayStillCurrent:target]) return [self fail:error code:8 text:@"目标屏幕当前不可用，未移动窗口。"];
+    NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+    if (!app || app.terminated || !app.bundleURL) return [self fail:error code:10 text:@"这个窗口所属的应用已经退出。"];
+    if (![self genericBundleAllowed:app.bundleIdentifier error:error]) return NO;
+    if ([self.ownedIDs containsObject:@(targetID)])
+        return [self performMoveApplicationAtURL:app.bundleURL sourceFilter:@(sourceID) onlyWindowID:windowID onlyPID:pid toDisplayID:targetID error:error];
+    if ([target[@"isVirtual"] boolValue]) return [self fail:error code:8 text:@"目标虚拟屏不可用，请先创建虚拟屏。"];
+    return [self performMoveSingleWindowToPhysical:app windowID:windowID sourceID:sourceID target:target error:error];
 }
 - (BOOL)performRestoreBundle:(NSString *)bundle sourceID:(CGDirectDisplayID)sourceID physicalTarget:(NSDictionary *)physicalTarget error:(NSError **)error {
     if (!YMWorkspaceGenericRestoreAllowed(bundle)) return [self fail:error code:4 text:@"请先把 yomado 控制面板移回实体屏，再关闭此虚拟屏。"];
     NSUInteger restored = 0, fallback = 0;
     for (NSRunningApplication *app in [NSRunningApplication runningApplicationsWithBundleIdentifier:bundle]) {
         if (app.terminated) continue;
-        NSArray *candidates = [self candidatesForApplication:app sourceFilter:sourceID ? @(sourceID) : nil error:error]; if (!candidates) return NO;
+        NSArray *candidates = [self candidatesForApplication:app sourceFilter:sourceID ? @(sourceID) : nil onlyWindowID:0 onlyPID:0 error:error]; if (!candidates) return NO;
         for (NSDictionary *candidate in candidates) {
             NSDictionary *source = [self display:[candidate[@"displayID"] unsignedIntValue]];
             if (![self.ownedIDs containsObject:source[@"displayID"]]) continue;

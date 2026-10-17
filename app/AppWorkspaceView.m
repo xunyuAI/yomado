@@ -97,6 +97,7 @@ static NSTextField *YMWorkspaceLabel(NSString *text, CGFloat size, NSFontWeight 
 @property(nonatomic) BOOL movable;
 @property(nonatomic) BOOL physical;
 @property(nonatomic) BOOL beganDragging;
+@property(nonatomic) BOOL consumedDrag;
 @property(nonatomic) BOOL sourceDragActive;
 @property(nonatomic) BOOL menuTracking;
 @property(nonatomic) NSPoint mouseDownPoint;
@@ -104,6 +105,7 @@ static NSTextField *YMWorkspaceLabel(NSString *text, CGFloat size, NSFontWeight 
 @property(nonatomic) CGFloat iconSize;
 @property(nonatomic,strong) NSTextField *nameLabel;
 @property(nonatomic,copy) void (^restoreApplication)(NSString *);
+@property(nonatomic,copy) void (^configureWindowMenu)(NSMenu *, NSDictionary *, uint32_t);
 @end
 @implementation YMWorkspaceApplicationIcon
 - (instancetype)initWithFrame:(NSRect)frame {
@@ -144,7 +146,7 @@ static NSTextField *YMWorkspaceLabel(NSString *text, CGFloat size, NSFontWeight 
     }
 }
 - (void)mouseDown:(NSEvent *)event {
-    self.mouseDownPoint=event.locationInWindow; self.beganDragging=NO;
+    self.mouseDownPoint=event.locationInWindow; self.beganDragging=NO; self.consumedDrag=NO;
     if (self.acceptsFirstResponder) [self.window makeFirstResponder:self];
 }
 - (void)mouseDragged:(NSEvent *)event {
@@ -159,7 +161,7 @@ static NSTextField *YMWorkspaceLabel(NSString *text, CGFloat size, NSFontWeight 
     NSPasteboardItem *item=[NSPasteboardItem new]; [item setData:data forType:YMWorkspaceApplicationType];
     NSDraggingItem *drag=[[NSDraggingItem alloc] initWithPasteboardWriter:item];
     NSPoint point=[self convertPoint:location fromView:nil];
-    [drag setDraggingFrame:NSMakeRect(point.x-self.iconSize/2,point.y-self.iconSize/2,self.iconSize,self.iconSize) contents:self.appIcon]; self.beganDragging=YES;
+    [drag setDraggingFrame:NSMakeRect(point.x-self.iconSize/2,point.y-self.iconSize/2,self.iconSize,self.iconSize) contents:self.appIcon]; self.beganDragging=YES; self.consumedDrag=YES;
     self.sourceDragActive=YES; YMWorkspaceBeginInteraction();
     @try {
         [self beginDraggingSessionWithItems:@[drag] event:event source:self].animatesToStartingPositionsOnCancelOrFail=YES;
@@ -175,20 +177,32 @@ static NSTextField *YMWorkspaceLabel(NSString *text, CGFloat size, NSFontWeight 
     self.beganDragging=NO;
     if (self.sourceDragActive) { self.sourceDragActive=NO; YMWorkspaceEndInteraction(); }
 }
-- (NSMenu *)menuForEvent:(NSEvent *)event { (void)event; return [self restoreMenu]; }
-- (NSMenu *)restoreMenu {
-    if (self.physical) return nil;
-    NSMenu *menu=[[NSMenu alloc] initWithTitle:self.nameLabel.stringValue]; menu.autoenablesItems=NO; menu.delegate=self;
-    NSString *title=[self.row[@"managedWindowCount"] unsignedIntegerValue] ? @"返回原显示器" : @"移回实体屏";
-    NSMenuItem *item=[[NSMenuItem alloc] initWithTitle:title action:@selector(restore:) keyEquivalent:@""];
-    item.target=self; item.enabled=self.movable && self.restoreApplication!=nil; [menu addItem:item]; return menu;
+- (void)mouseUp:(NSEvent *)event {
+    (void)event;
+    BOOL dragged=self.consumedDrag; self.consumedDrag=NO;
+    if (dragged || self.beganDragging || !self.movable || [self.row[@"windowCount"] unsignedIntegerValue] <= 1) return;
+    NSMenu *menu=[self actionMenu];
+    if (!menu) return;
+    [menu popUpMenuPositioningItem:nil atLocation:NSMakePoint(0, self.bounds.size.height) inView:self];
+}
+- (NSMenu *)menuForEvent:(NSEvent *)event { (void)event; return [self actionMenu]; }
+- (NSMenu *)actionMenu {
+    NSMenu *menu=[[NSMenu alloc] initWithTitle:self.nameLabel.stringValue ?: @""]; menu.autoenablesItems=NO; menu.delegate=self;
+    if (!self.physical) {
+        NSString *title=[self.row[@"managedWindowCount"] unsignedIntegerValue] ? @"返回原显示器" : @"移回实体屏";
+        NSMenuItem *item=[[NSMenuItem alloc] initWithTitle:title action:@selector(restore:) keyEquivalent:@""];
+        item.target=self; item.enabled=self.movable && self.restoreApplication!=nil; [menu addItem:item];
+    }
+    if ([self.row[@"windowCount"] unsignedIntegerValue] > 1 && self.configureWindowMenu)
+        self.configureWindowMenu(menu, self.row, self.sourceDisplayID);
+    return menu.numberOfItems ? menu : nil;
 }
 - (void)menuWillOpen:(NSMenu *)menu { (void)menu; if (!self.menuTracking) { self.menuTracking=YES; YMWorkspaceBeginInteraction(); } }
 - (void)menuDidClose:(NSMenu *)menu { (void)menu; if (self.menuTracking) { self.menuTracking=NO; YMWorkspaceEndInteraction(); } }
 - (void)dealloc { if (_sourceDragActive) YMWorkspaceEndInteraction(); if (_menuTracking) YMWorkspaceEndInteraction(); }
 - (void)restore:(id)sender { (void)sender; if (self.movable && self.restoreApplication) self.restoreApplication(self.row[@"bundleIdentifier"]); }
 - (BOOL)accessibilityPerformPress {
-    NSMenu *menu=[self restoreMenu]; if (!menu || !self.movable) return NO;
+    NSMenu *menu=[self actionMenu]; if (!menu || !self.movable) return NO;
     [menu popUpMenuPositioningItem:nil atLocation:NSMakePoint(0,43) inView:self]; return YES;
 }
 - (BOOL)accessibilityPerformShowMenu { return [self accessibilityPerformPress]; }
@@ -446,12 +460,16 @@ static NSTextField *YMWorkspaceLabel(NSString *text, CGFloat size, NSFontWeight 
         icon.row=row; icon.sourceDisplayID=self.displayID; icon.physical=self.isPhysicalWorkspace; icon.movable=self.available && self.trusted;
         icon.appIcon=[row[@"appIcon"] isKindOfClass:NSImage.class] ? row[@"appIcon"] : [NSImage imageWithSystemSymbolName:@"app" accessibilityDescription:nil];
         icon.nameLabel.stringValue=[row[@"appName"] isKindOfClass:NSString.class] ? row[@"appName"] : row[@"bundleIdentifier"];
-        icon.toolTip=[NSString stringWithFormat:@"%@ · %@ 个窗口\n拖到其他屏幕%@",icon.nameLabel.stringValue,row[@"windowCount"],icon.physical ? @"" : @"；右键可返回实体屏"];
+        NSUInteger windowCount=[row[@"windowCount"] unsignedIntegerValue];
+        icon.toolTip=windowCount>1
+            ? [NSString stringWithFormat:@"%@ · %lu 个窗口\n点击图标，选择其中一个再移到另一块屏幕。拖动图标会移动这个屏幕上该应用的全部窗口。",icon.nameLabel.stringValue,(unsigned long)windowCount]
+            : [NSString stringWithFormat:@"%@ · %@ 个窗口\n拖到其他屏幕%@",icon.nameLabel.stringValue,row[@"windowCount"],icon.physical ? @"" : @"；右键可返回实体屏"];
         [icon setAccessibilityRole:icon.physical ? NSAccessibilityImageRole : NSAccessibilityButtonRole];
         [icon setAccessibilityLabel:[NSString stringWithFormat:@"%@，%@ 个窗口",icon.nameLabel.stringValue,row[@"windowCount"]]];
-        [icon setAccessibilityHelp:icon.physical ? @"拖到虚拟屏，或使用目标屏幕的添加应用按钮。" : @"拖到其他屏幕，或按空格打开返回菜单。"];
+        [icon setAccessibilityHelp:windowCount>1 ? @"点击后选择其中一个窗口，再选择目标屏幕。" : (icon.physical ? @"拖到虚拟屏，或使用目标屏幕的添加应用按钮。" : @"拖到其他屏幕，或按空格打开返回菜单。")];
         __weak typeof(self) weakSelf=self;
         icon.restoreApplication=^(NSString *identifier) { if (weakSelf.onRestoreBundleIdentifier) weakSelf.onRestoreBundleIdentifier(identifier); };
+        icon.configureWindowMenu=weakSelf.onConfigureWindowMenu;
         icon.needsDisplay=YES;
         [icons addObject:icon];
     }
